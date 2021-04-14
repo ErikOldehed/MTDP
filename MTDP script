@@ -1,0 +1,286 @@
+library(quantmod)
+
+#Function to extract a subsection of the series from the start.
+from.start = function(X, n = dim(X)[1], skip = 0) {
+  X = as.matrix(X)
+  r = rownames(X)
+  c = colnames(X)
+  M = dim(X)[1]
+  X = as.matrix(head(X[c((1 + skip):M), ], n))
+  R = head(r[c((1 + skip):M)], n)
+  rownames(X) = R
+  colnames(X) = c
+  X
+}
+#Function to extract a subsection of the series from the end.
+from.end = function(X, n = dim(X)[1], skip = 0) {
+  X = as.matrix(X)
+  r = rownames(X)
+  c = colnames(X)
+  M = dim(X)[1]
+  X = as.matrix(tail(X[c(1:(M - skip)), ], n))
+  R = tail(r[c(1:(M - skip))], n)
+  rownames(X) = R
+  colnames(X) = c
+  X
+}
+#Function to calculate log returns.
+log.return = function(df) {
+  df = as.matrix(df)
+  r = log(from.start(df, skip = 1) / from.end(df, skip = 1))
+  comment(r) <- "log.return"
+  r
+}
+#Function to obtain stock price data for several stocks at once.
+get.price = function(ticker, what = "close") {
+  library(quantmod)
+  options("getSymbols.warning4.0" = FALSE)
+  if (what == "open") {what = 1}
+  if (what == "high") {what = 2}
+  if (what == "low") {what = 3}
+  if (what == "close") {what = 4}
+  if (what == "volume") {what = 5}
+  if (what == "adjusted") {what = 6}
+  #Reformat the ticker to evaluate the data and save it in a data frame.
+  ticker.get = gsub("[^a-zA-Z0-9.-]", "", ticker)
+  if (length(ticker) > 1) {
+    time = system.time({
+      suppressWarnings(getSymbols(ticker[1], warnings = FALSE))
+      df = get(ticker.get[1])[, what]
+    })[3]
+    p = length(ticker)
+    cat(paste(
+      paste(
+        "Estimated time left = ",
+        round((time + 5) * (p)),
+        " sec. ",
+        '\b',
+        " Progress: preparing symbol ",
+        1,
+        " of ",
+        p,
+        ". Today is a great day for some trading!",
+        sep = ""
+      ),
+      '\r'
+    ))
+    for (i in 2:p) {
+      suppressWarnings(getSymbols(ticker[i], warnings = FALSE))
+      df = merge(df, get(ticker.get[i])[, what])
+      cat(paste(
+        paste(
+          "Estimated time left = ",
+          trunc((time + 5) * (p - i)/60),
+          " min and ",round(((time + 5) * (p - i)/60-trunc((time + 5) * (p - i)/60))*60)," sec. ",
+          '\b',
+          " Progress: preparing symbol ",
+          i,
+          " of ",
+          p,
+          ". Today is a great day for some trading!",
+          sep = ""
+        ),
+        '\r'
+      ))
+      Sys.sleep(5)
+    }
+  }
+  if (length(ticker) == 1) {
+    suppressWarnings(getSymbols(ticker, warnings = FALSE))
+    df = get(ticker.get)[, what]
+  }
+  return(df)
+}
+
+#Function to clean the stock price data in case of 
+#missing observations. Several methods found to work
+#well for stock data in the litterature are averaged.
+
+clean.ts = function(data) {
+  #This function calculates the weighted average of three imputation methods
+  #performing well in backtests on financial data.
+  library(imputeTS)
+  library(mtsdi)
+  library(questionr)
+  Y.Imp = matrix(NA, ncol = dim(data)[2], nrow = dim(data)[1])
+  cat("Imputation task is: Linear interpolation (imputeTS::na_interpolation) \n")
+  Y.Linear = na_interpolation(as.data.frame(data))
+  cat("Imputation using approx in progress...done! \n")
+  cat("Imputation task is: Kalman filter (imputeTS::na_kalman) \n")
+  Y.Kalman = as.matrix(na_kalman(as.data.frame(data), type = "level"))
+  cat("Imputation using StructTS in progress...done! \n")
+  cat("Imputation task is: EM algorithm imputation (mtsdi::mnimput) \n")
+  Y.EM = mnimput(add.formula(data), dataset = as.data.frame(data))$filled.dataset
+  cat("Imputation using spline in progress...done! \n")
+  Y.Imp = as.data.frame((Y.Kalman  + Y.Linear  + Y.EM) / 3)
+  tab =  freq.na(data)
+  invisible(
+    list(
+      Clean.Data = Y.Imp,
+      Original.Data =
+        as.data.frame(data),
+      missing = message(paste0(
+        c(
+          sum(is.na(data)),
+          " missing values where imputed using an ensemble of linear interpolation, kalman and EM",
+          "."
+        ),
+        collapse = ''
+      )),
+      missing = message(paste0(capture.output(tab), collapse = "\n"))
+    )
+  )
+}
+
+#Function to obtain price data, cleaned from missing observations.
+get.clean.price = function(ticker) {
+  df = get.price(ticker)
+  if (sum(is.na(df)) > 0) {
+    #Omit all observations in the beginning of the series where all entries in
+    #one of the stocks are NA. This is to avoid interpolation of stocks that was
+    #not listed or founded at this time.
+    p = dim(df)[2]
+    missing.row = apply(df, 1, function(X)
+      p - sum(is.na(X)))
+    df.naomit = df[(pmatch(p, missing.row) - 1):(dim(df)[1]), ]
+    if (sum(is.na(df.naomit[-1, ])) > 0) {
+      df.clean = clean.ts(df.naomit)
+      df.clean$Returns = log.return(df.clean$Clean.Data)
+    } else
+      (df.clean = list("Clean.Data" = df.naomit[-1, ],
+                       "Returns" = log.return(df.naomit[-1, ])))
+  } else
+    (df.clean = list("Clean.Data" = df, "Returns" = log.return(df)))
+  colnames(df.clean$Returns)=ticker
+  return(df.clean)
+}
+
+#Function to calculate the optimal weights for a 
+#stock portfolio using extreme value theory and the 
+#coefficient of tail dependence.
+MTDP=function(X,p,method,cores=7,sd.period=dim(X)[1]) 
+{
+  library("copula")
+  library("cccp")
+  library("FRAPO")
+  #This portfolio optimisation algorithm is a modification of the PMTD
+  #function of the FRAPO library, adding the Student t parametric estimate and
+  #CFG nonparametric estimate. I have added the CFG and Student t copulas to the tdc (FRAPO)
+  #method arguments and omit the EVT copula. The Student t estimate is based on
+  #the fitLambda function of the copula package but modified to speed up
+  #calculation time using martix formulation, parallel processing and C++
+  #computation. I have coded the CFG estimate based on the derivation suggested
+  #by Frahm, G.,  Junker, M. and Schmidt, R. (2005) of the Capéraà, P.,
+  #Fougères, AL and Genest, C. (1997) estimate.
+  tdct=function(u, p = min(100/nrow(u), 0.1), method) 
+  {
+    library("parallel")
+    library("foreach")
+    library("doParallel")
+    library("mvnfast")
+    library("Rfast")
+    if (!is.matrix(u)) 
+      u <- rbind(u, deparse.level = 0L)
+    d <- ncol(u)
+    switch(method, t = {
+      Lam <- diag(1, nrow = d)
+      mu=rep(0,2)
+      nLLt <- function(nu, P, u) {
+        x <- qt(u, df = nu)
+        -sum(mvnfast::dmvt(x, sigma = P, mu,df = nu, log = TRUE) - 
+               Rfast::rowsums(dt(x, df = nu, log = TRUE)))
+      }
+      opt<-function(i){
+        f <- function(j){
+          u. <- u[, c(i, j)]
+          P. <- sin(cor(u.,method="kendall") * pi/2)
+          rho <- P.[2, 1]
+          nu <- optimize(f=nLLt,P=P.,u=u., interval = c(1e-04, 10))$minimum
+          Lam[i, j] <- 2 * pt(-sqrt((nu + 1) * (1 - rho)/(1 + rho)), df = nu + 1)
+          Lam[i, j]
+        }
+        Lam[i,1:(i - 1) ]<-unlist(parallel::mclapply(1:(i - 1),f))
+        Lam[i,]
+      }
+      cl <- makeCluster(cores) # create a cluster
+      registerDoParallel(cl) # register the cluster
+      Lam[2:d,]=foreach(i =2:d,.combine="rbind",.export="Lam")%dopar%{opt(i)}
+      stopCluster(cl) # shut down the cluster
+      ii <- upper.tri(Lam)
+      Lam[ii] <- t(Lam)[ii]
+      return(Lam)}, CFG={
+        TDC.CFG=function(u){
+          g=function(U,V,lower.tail){
+            if(lower.tail==TRUE){
+              U=1-U
+              V=1-V
+            }
+            n=length(U)
+            2-2*exp(
+              (1/n)*sum(log(sqrt(log(1/U)*log(1/V))/log(1/(apply(cbind(U,V),1,max)^2))))
+            ) 
+          }
+          d <- ncol(u)
+          Lam <- diag(1, nrow = d)
+          for(i in 2:d){
+            for(j in 1:(i-1)){
+              Lam[i,j]= g(u[,i],u[,j],lower.tail=TRUE)  
+            }  
+          }
+          ii <- upper.tri(Lam)
+          Lam[ii] <- t(Lam)[ii]
+          Lam
+        }
+        return(TDC.CFG(u))
+      },EmpTC={
+        return(tdc(u,method="EmpTC"))
+      }, stop("Wrong 'method'"))
+  }
+  if (is.null(dim(X))) {
+    stop("Argument for 'Returns' must be rectangular.\n")
+  }
+  call <- match.call()
+  u=apply(X,2,pobs)
+  if(method=="tCFG"){
+    V<-  tdct(u,method="t")*0.5+tdct(u,method="CFG")*0.5
+  }else(V <- tdct(u,method=method))
+  N <- ncol(u)
+  A <- matrix(rep(1, N), nrow = 1)
+  b <- 1
+  nno1 <- nnoc(G = -diag(N), h = rep(0, N))
+  opt <- cccp(P = 2 * V, q = rep(0, N), A = A, b = b, cList = list(nno1))
+  w <- drop(getx(opt))
+  sd <- sqrt(diag(cov(from.end(X,n=sd.period))))
+  w <- w/sd
+  w <- w/sum(w)
+  names(w) <- colnames(X)
+  new("PortSol", weights = w, opt = list(opt), type = "Minimum Tail Dependent", 
+      call = call)
+}
+
+##Example
+#First we select three stocks to obtain price data for 
+#by their respective "ticker" (shortnames).
+ticker=c("ABB.ST","ERIC-B.ST", "BOL.ST")
+#Now, lets obtain the cleaned price data.
+V=get.clean.price(ticker)
+#Finally, we calculate the optimal weights using an empirical 
+#tail dependence coefficient. This function is integrated in 
+#the original FRAPO function (PMTD). Lets see how they compare
+#in speed.
+time = system.time({W=MTDP(V$Returns,method="EmpTC",cores=7)})
+time2 = system.time({W2=PMTD(Returns, method=c("EmpTC"))})
+time2[3]/time[3]
+#Here are the weights of our function
+W
+#When a student t copula is used we can not compare the function 
+#to the original, since this is a feature I have added.
+#Lets try the student t coefficient of tail dependence.
+time3 = system.time({W3=MTDP(V$Returns,method="t",cores=7)})
+W3
+#Now lets try a CFG copula. It is a non parametric estimate of
+#an extreme value copula (See Capéraà, P.,
+#Fougères, AL and Genest, C., 1997). 
+time4 = system.time({W4=MTDP(V$Returns,method="CFG",cores=7)})
+W4
+
